@@ -4,7 +4,7 @@
 # Disk Speed Test Script
 # - Path argument support
 # - Log file: disk-speed-test-<hostname>.log
-# - New: Mode selection (dsync or direct)
+# - Interactive prompts for size, block size, and mode (if not specified)
 # =============================================
 
 set -euo pipefail
@@ -26,11 +26,11 @@ log "================================================================="
 
 # === CONFIGURATION ===
 TEST_FILE="dd_speed_test.tmp"
-TEST_SIZE="1G"        # Default: 1GB
-BLOCK_SIZE="1M"
+TEST_SIZE=""          # Will be prompted if empty
+BLOCK_SIZE=""         # Will be prompted if empty
 TARGET_DIR=""
 TIMEOUT=120
-OFLAG_MODE="dsync"    # New: default is dsync
+OFLAG_MODE=""         # Will be prompted if empty
 
 # === COLORS ===
 RED='\033[0;31m'
@@ -45,17 +45,14 @@ usage() {
 Usage: $0 [OPTIONS] /path/to/test/directory
 
 Options:
-  -s SIZE     Test size (512M, 1G, 2G, ...) [default: 1G]
-  -b BS       Block size (1M, 4M, 128K, ...) [default: 1M]
+  -s SIZE     Test size (512M, 1G, 2G, ...) 
+  -b BS       Block size (1M, 4M, 128K, ...) 
+  -m MODE     oflag mode: dsync or direct
   -t SEC      Timeout per test (0 = unlimited) [default: 120]
-  -m MODE     oflag mode: dsync or direct [default: dsync]
-  -f          Fast mode (no oflag - uses cache, less accurate)
+  -f          Fast mode (no oflag - uses cache)
   -h          Show this help
 
-Examples:
-  $0 /mnt/ssd
-  $0 -s 2G -m direct /mnt/nvme
-  $0 -m dsync -b 4M /tmp
+If -s, -b, or -m are not provided, the script will ask interactively.
 EOF
     exit 1
 }
@@ -66,7 +63,7 @@ while getopts "s:b:t:m:fh" opt; do
         s) TEST_SIZE="${OPTARG^^}" ;;
         b) BLOCK_SIZE="${OPTARG^^}" ;;
         t) TIMEOUT="$OPTARG" ;;
-        m) OFLAG_MODE="${OPTARG,,}" ;;   # convert to lowercase
+        m) OFLAG_MODE="${OPTARG,,}" ;;
         f) OFLAG_MODE="none" ;;
         h) usage ;;
         *) usage ;;
@@ -90,13 +87,36 @@ if [ ! -d "$TARGET_DIR" ]; then
     exit 1
 fi
 
+# === INTERACTIVE PROMPTS (if not specified) ===
+if [ -z "$TEST_SIZE" ]; then
+    read -rp "Enter test size [default: 1G]: " input_size
+    TEST_SIZE="${input_size^^:-1G}"
+fi
+
+if [ -z "$BLOCK_SIZE" ]; then
+    read -rp "Enter block size [default: 1M]: " input_block
+    BLOCK_SIZE="${input_block^^:-1M}"
+fi
+
+if [ -z "$OFLAG_MODE" ]; then
+    echo "Select write mode:"
+    echo "  1) dsync   (recommended for most accurate results)"
+    echo "  2) direct  (bypasses cache completely)"
+    read -rp "Choose (1 or 2) [default: 1]: " input_mode
+    case "${input_mode:-1}" in
+        1|d|dsync) OFLAG_MODE="dsync" ;;
+        2|direct)  OFLAG_MODE="direct" ;;
+        *)         OFLAG_MODE="dsync" ;;
+    esac
+fi
+
 # Validate mode
 if [[ "$OFLAG_MODE" != "dsync" && "$OFLAG_MODE" != "direct" && "$OFLAG_MODE" != "none" ]]; then
-    log "${RED}Error: Invalid mode. Use 'dsync', 'direct', or -f for none.${NC}"
+    log "${RED}Error: Invalid mode. Must be dsync or direct.${NC}"
     exit 1
 fi
 
-# === CALCULATE SIZE & COUNT (same as before) ===
+# === CALCULATE SIZE & COUNT ===
 SIZE_NUM=$(echo "$TEST_SIZE" | grep -oE '[0-9]+')
 SIZE_UNIT=$(echo "$TEST_SIZE" | grep -oE '[KMG]$' || echo "M")
 
@@ -104,7 +124,7 @@ case "$SIZE_UNIT" in
     K) TOTAL_BYTES=$((SIZE_NUM * 1024)) ;;
     M) TOTAL_BYTES=$((SIZE_NUM * 1024 * 1024)) ;;
     G) TOTAL_BYTES=$((SIZE_NUM * 1024 * 1024 * 1024)) ;;
-    *) log "${RED}Invalid size unit.${NC}"; exit 1 ;;
+    *) log "${RED}Invalid size unit. Use K, M or G.${NC}"; exit 1 ;;
 esac
 
 BS_NUM=$(echo "$BLOCK_SIZE" | grep -oE '[0-9]+')
@@ -114,17 +134,16 @@ case "$BS_UNIT" in
     K) BLOCK_BYTES=$((BS_NUM * 1024)) ;;
     M) BLOCK_BYTES=$((BS_NUM * 1024 * 1024)) ;;
     G) BLOCK_BYTES=$((BS_NUM * 1024 * 1024 * 1024)) ;;
-    *) log "${RED}Invalid block size unit${NC}"; exit 1 ;;
+    *) log "${RED}Invalid block size unit.${NC}"; exit 1 ;;
 esac
 
 COUNT=$((TOTAL_BYTES / BLOCK_BYTES))
-[ "$COUNT" -eq 0 ] && { log "${RED}Test size too small.${NC}"; exit 1; }
+[ "$COUNT" -eq 0 ] && { log "${RED}Test size too small for chosen block size.${NC}"; exit 1; }
 
 # === FREE SPACE CHECK ===
 FREE_KB=$(df "$TARGET_DIR" --output=avail | tail -1)
-FREE_BYTES=$((FREE_KB * 1024))
-if [ "$FREE_BYTES" -lt $((TOTAL_BYTES * 2)) ]; then
-    log "${RED}Not enough free space!${NC}"
+if [ "$FREE_KB" -lt $((TOTAL_BYTES * 2 / 1024)) ]; then
+    log "${RED}Not enough free space in $TARGET_DIR${NC}"
     exit 1
 fi
 
@@ -159,7 +178,7 @@ WRITE_SPEED=$(echo "$WRITE_OUT" | tail -n 1 | grep -oE '[0-9.]+ [KMGT]B/s' | hea
 log "${GREEN}Write: $WRITE_SPEED${NC}"
 log ""
 
-# === READ TEST (always with iflag=direct when possible) ===
+# === READ TEST ===
 log "${GREEN}Testing READ speed...${NC}"
 sync
 
@@ -192,4 +211,4 @@ log "Log saved to: $LOGFILE"
 log "Completed at: $(date)"
 log "================================================================="
 
-echo -e "${GREEN}Test finished! Log: $LOGFILE${NC}"
+echo -e "${GREEN}Test finished! Log file: $LOGFILE${NC}"
